@@ -1,3 +1,4 @@
 node_modules/
 GRADING.md
 seeds/*.ts
+reports/
