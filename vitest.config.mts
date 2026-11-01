@@ -2,9 +2,7 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    environment: 'node',
-    include: ['tests/**/*.test.ts'],
-    // Production runs in Paris; date logic must not depend on the machine's timezone.
+    // CI machines usually run in UTC, where timezone bugs stay hidden. Run in Paris, like production.
     env: { TZ: 'Europe/Paris' },
   },
 });
