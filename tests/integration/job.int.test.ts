@@ -1,4 +1,3 @@
-import { Client } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { db } from '../../src/db';
 import { runAutoMatching, type RunSummary } from '../../src/job';
@@ -8,34 +7,17 @@ import { resetSchema } from '../../src/schema';
 const SIREN = '900997767';
 const quiet = { info: () => {}, warn: () => {} };
 
-async function ensureTestDatabase() {
-  const admin = new Client({
-    host: process.env.PGHOST ?? 'localhost',
-    port: Number(process.env.PGPORT ?? 5432),
-    user: process.env.PGUSER ?? 'postgres',
-    password: process.env.PGPASSWORD ?? 'postgres',
-    database: 'postgres',
-  });
-  await admin.connect();
-  try {
-    const { rowCount } = await admin.query('select 1 from pg_database where datname = $1', ['matching_test']);
-    if (!rowCount) await admin.query('create database matching_test');
-  } finally {
-    await admin.end();
-  }
-}
-
 const count = async (sql: string) => Number((await db.query<{ n: string }>(sql)).rows[0].n);
 
-describe('auto-matching against the seed (needs Docker)', () => {
+// Runs the real job on the seed. Needs the Docker Postgres from the README, and reseeds it
+// (like `npm run db:reset`).
+describe('auto-matching against the seed', () => {
   let first: RunSummary;
 
   beforeAll(async () => {
-    expect(process.env.PGDATABASE).toBe('matching_test');
-    await ensureTestDatabase();
     await resetSchema(db);
     ({ summary: first } = await runAutoMatching(SIREN, { repo: createPgRepository(db), logger: quiet }));
-  });
+  }, 60_000);
 
   afterAll(async () => {
     await db.end();
