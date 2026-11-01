@@ -1,131 +1,98 @@
-import type { Decision, InvoiceRecord, Outcome, SkippedInvoice, TransactionRecord } from './matching/types';
+import { daysBetween, parseCalendarDate } from './dates';
+import type { Decision, InvoiceRecord, TransactionRecord } from './matching/types';
 
 /**
- * How urgently a human should look at a row. Sorted in this order in the CSV,
- * so problems and duplicates are at the top.
+ * The review sheet for the finance team: every transaction the job refused to
+ * match because several invoices fit equally well.
+ *
+ * One row per (transaction, candidate invoice), so the sheet can be filtered
+ * and sorted in a spreadsheet. The transaction columns are repeated on each of
+ * its rows on purpose. Finance marks the right invoice in `finance_choice`.
  */
-export type Flag = 'PROBLEM' | 'REVIEW' | 'UNMATCHED' | 'MATCHED';
-
-const FLAG_ORDER: Record<Flag, number> = { PROBLEM: 0, REVIEW: 1, UNMATCHED: 2, MATCHED: 3 };
-
-const FLAG_BY_OUTCOME: Record<Outcome, Flag> = {
-  duplicate_feed_row: 'PROBLEM',
-  conflict: 'PROBLEM',
-  invalid_data: 'PROBLEM',
-  not_outgoing: 'PROBLEM',
-  ambiguous: 'REVIEW',
-  reference_mismatch: 'REVIEW',
-  no_candidate: 'UNMATCHED',
-  matched: 'MATCHED',
-};
-
-export const TRANSACTION_COLUMNS = [
-  'flag',
-  'outcome',
+export const REVIEW_COLUMNS = [
   'transaction_id',
   'remote_id',
-  'date',
+  'transaction_date',
   'amount',
   'label',
   'reference',
-  'strategy',
-  'invoice_id',
+  'candidate_count',
+  'candidate',
   'invoice_number',
   'supplier',
   'invoice_due_date',
-  'candidate_invoices',
-  'detail',
-] as const;
-
-export type TransactionReportRow = Record<(typeof TRANSACTION_COLUMNS)[number], string>;
-
-export const SKIPPED_INVOICE_COLUMNS = [
-  'reason',
+  'days_due_after_payment',
   'invoice_id',
-  'invoice_number',
-  'supplier',
-  'tax_free_total',
-  'vat_amount',
-  'due_date',
-  'detail',
+  'finance_choice',
 ] as const;
 
-export type SkippedInvoiceReportRow = Record<(typeof SKIPPED_INVOICE_COLUMNS)[number], string>;
+export type ReviewRow = Record<(typeof REVIEW_COLUMNS)[number], string>;
 
-export type Report = {
-  transactions: TransactionReportRow[];
-  skippedInvoices: SkippedInvoiceReportRow[];
-};
+function daysDueAfterPayment(transactionDate: string | null, dueDate: string | null): string {
+  try {
+    return String(daysBetween(parseCalendarDate(transactionDate), parseCalendarDate(dueDate)));
+  } catch {
+    return '';
+  }
+}
 
-const describeInvoice = (invoice: InvoiceRecord | undefined) =>
-  invoice ? `${invoice.invoiceNumber || '(no number)'} ${invoice.supplierName ?? '(no supplier)'} due ${invoice.dueDate ?? '?'}` : '';
-
-export function buildReport(input: {
+export function buildReviewReport(input: {
   transactions: readonly TransactionRecord[];
   invoices: readonly InvoiceRecord[];
   decisions: readonly Decision[];
-  skippedInvoices: readonly SkippedInvoice[];
-}): Report {
+}): ReviewRow[] {
   const transactionsById = new Map(input.transactions.map((t) => [t.id, t]));
   const invoicesById = new Map(input.invoices.map((i) => [i.id, i]));
 
-  const transactions = input.decisions.map((decision): TransactionReportRow => {
+  const groups = input.decisions.flatMap((decision) => {
+    if (decision.outcome !== 'ambiguous') return [];
     const tx = transactionsById.get(decision.transactionId);
-    const outcome = decision.outcome;
-    const invoice = decision.outcome === 'matched' ? invoicesById.get(decision.invoiceId) : undefined;
-    const candidates =
-      decision.outcome === 'matched' ? [] : (decision.candidateInvoiceIds ?? []).map((id) => invoicesById.get(id));
-
-    return {
-      flag: FLAG_BY_OUTCOME[outcome],
-      outcome,
-      transaction_id: decision.transactionId,
-      remote_id: tx?.remoteId ?? '',
-      date: tx?.date ?? '',
-      amount: tx?.amount ?? '',
-      label: tx?.label ?? '',
-      reference: tx?.reference ?? '',
-      strategy: decision.outcome === 'matched' ? decision.strategy : '',
-      invoice_id: invoice?.id ?? '',
-      invoice_number: invoice?.invoiceNumber ?? '',
-      supplier: invoice?.supplierName ?? '',
-      invoice_due_date: invoice?.dueDate ?? '',
-      candidate_invoices: candidates.map(describeInvoice).filter(Boolean).join(' | '),
-      detail: decision.outcome === 'matched' ? '' : (decision.detail ?? ''),
-    };
+    const candidates = (decision.candidateInvoiceIds ?? [])
+      .map((id) => invoicesById.get(id))
+      .filter((invoice): invoice is InvoiceRecord => invoice !== undefined);
+    if (!tx || candidates.length < 2) return [];
+    // Closest due date first, then a stable order.
+    candidates.sort(
+      (a, b) =>
+        (a.dueDate ?? '').localeCompare(b.dueDate ?? '') ||
+        (a.invoiceNumber ?? '').localeCompare(b.invoiceNumber ?? '') ||
+        a.id.localeCompare(b.id),
+    );
+    return [{ tx, candidates }];
   });
 
-  // Problems first; within a flag, group by outcome, then put copies of the
-  // same bank row next to each other.
-  transactions.sort(
+  // Oldest payments first: those are the ones finance should clear first.
+  groups.sort(
     (a, b) =>
-      FLAG_ORDER[a.flag as Flag] - FLAG_ORDER[b.flag as Flag] ||
-      a.outcome.localeCompare(b.outcome) ||
-      a.remote_id.localeCompare(b.remote_id) ||
-      a.date.localeCompare(b.date) ||
-      a.transaction_id.localeCompare(b.transaction_id),
+      (a.tx.date ?? '').localeCompare(b.tx.date ?? '') ||
+      (a.tx.remoteId ?? '').localeCompare(b.tx.remoteId ?? '') ||
+      a.tx.id.localeCompare(b.tx.id),
   );
 
-  const skippedInvoices = input.skippedInvoices.map((skipped): SkippedInvoiceReportRow => {
-    const invoice = invoicesById.get(skipped.invoiceId);
-    return {
-      reason: skipped.reason,
-      invoice_id: skipped.invoiceId,
-      invoice_number: invoice?.invoiceNumber ?? '',
-      supplier: invoice?.supplierName ?? '',
-      tax_free_total: invoice?.taxFreeTotal ?? '',
-      vat_amount: invoice?.vatAmount ?? '',
-      due_date: invoice?.dueDate ?? '',
-      detail: skipped.detail ?? '',
-    };
-  });
-  skippedInvoices.sort((a, b) => a.reason.localeCompare(b.reason) || a.invoice_id.localeCompare(b.invoice_id));
-
-  return { transactions, skippedInvoices };
+  return groups.flatMap(({ tx, candidates }) =>
+    candidates.map(
+      (invoice, index): ReviewRow => ({
+        transaction_id: tx.id,
+        remote_id: tx.remoteId ?? '',
+        transaction_date: tx.date ?? '',
+        amount: tx.amount,
+        label: tx.label ?? '',
+        reference: tx.reference ?? '',
+        candidate_count: String(candidates.length),
+        candidate: `${index + 1}/${candidates.length}`,
+        invoice_number: invoice.invoiceNumber ?? '',
+        supplier: invoice.supplierName ?? '',
+        invoice_due_date: invoice.dueDate ?? '',
+        days_due_after_payment: daysDueAfterPayment(tx.date, invoice.dueDate),
+        invoice_id: invoice.id,
+        finance_choice: '',
+      }),
+    ),
+  );
 }
 
 /** Columns holding bank or supplier text, which may come from outside. */
-const FREE_TEXT = new Set(['label', 'reference', 'supplier', 'invoice_number', 'candidate_invoices', 'detail']);
+const FREE_TEXT = new Set(['label', 'reference', 'supplier', 'invoice_number']);
 
 function escapeCell(column: string, value: string): string {
   // A spreadsheet treats a cell starting with = + - @ as a formula. Bank labels

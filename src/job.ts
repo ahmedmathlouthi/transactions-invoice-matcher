@@ -1,7 +1,7 @@
 import { CompanyNotFoundError, InvalidInputError } from './errors';
 import { decide, DEFAULT_CONFIG } from './matching/decide';
 import type { Decision, MatchedDecision, MatchingConfig, Outcome, SkippedInvoice } from './matching/types';
-import { buildReport, type Report } from './report';
+import { buildReviewReport, type ReviewRow } from './report';
 import type { MatchingRepository } from './repository';
 
 export type Logger = Pick<Console, 'info' | 'warn'>;
@@ -29,8 +29,8 @@ export type RunSummary = {
 
 export type RunResult = {
   summary: RunSummary;
-  /** Row-level detail of the run, for the CSV export. */
-  report: Report;
+  /** Ambiguous transactions with their candidate invoices, for the finance team. */
+  review: ReviewRow[];
 };
 
 const SIREN = /^\d{9}$/;
@@ -88,6 +88,6 @@ export async function runAutoMatching(siren: string, deps: JobDeps): Promise<Run
     skippedInvoices: countBy(skippedInvoices, (s) => s.reason),
     durationMs: now().getTime() - startedAt.getTime(),
   };
-  const report = buildReport({ transactions, invoices, decisions, skippedInvoices });
-  return { summary, report };
+  const review = buildReviewReport({ transactions, invoices, decisions });
+  return { summary, review };
 }
