@@ -281,6 +281,12 @@ and dependencies passed as parameters.
 
 ### Left undone, on purpose
 - Only one migration: a nullable `matched_at` column. The database is treated as production.
+  It is a minimal audit log, set by the job only:
+  - every match of a run gets the run's start time, so `matched_at` identifies the run;
+  - `NULL` with a match means the match existed before (e.g. made by hand), and the job never
+    touches it;
+  - a bad run can be listed or undone in one statement, by its `matched_at`;
+  - not yet stored: which rule made each match, or who made a manual one (a `matched_by` column).
 - Schema follow-ups, each needing a clean-up or a zero-downtime migration first:
   - amounts `real` → `numeric(14,2)`; amounts above ~€10,000 may have lost cents and must be
     re-imported
