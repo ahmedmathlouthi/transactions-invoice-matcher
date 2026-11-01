@@ -28,7 +28,7 @@ describe('decide', () => {
     });
   });
 
-  it('compares amounts in cents, so float sums still match (finding 6)', () => {
+  it('compares amounts in cents, so float sums still match (finding 9)', () => {
     expect(1.74 + 0.54).not.toBe(2.28); // 2.2800000000000002
     const target = invoice({ taxFreeTotal: '1.74', vatAmount: '0.54' });
     expect(only(decide([tx({ amount: '-2.28' })], [target])).outcome).toBe('matched');
@@ -57,12 +57,12 @@ describe('decide', () => {
     expect(decision.outcome).toBe('ambiguous');
   });
 
-  it('does not crash on a NULL supplier name, and still matches (finding 10)', () => {
+  it('does not crash on a NULL supplier name, and still matches (finding 3)', () => {
     const decision = only(decide([tx()], [invoice({ supplierName: null })]));
     expect(decision.outcome).toBe('matched');
   });
 
-  it('flags duplicated bank-feed rows instead of matching them (finding 3)', () => {
+  it('flags duplicated bank-feed rows instead of matching them (finding 6)', () => {
     const decision = only(decide([tx({ feedCopies: 2 })], [invoice()]));
     expect(decision.outcome).toBe('duplicate_feed_row');
   });
@@ -81,7 +81,7 @@ describe('decide', () => {
     expect(only(decide([tx({ amount: '44.99' })], [invoice()])).outcome).toBe('not_outgoing');
   });
 
-  it('reports invoices it could not consider (finding 8)', () => {
+  it('reports invoices it could not consider (finding 10)', () => {
     const { skippedInvoices } = decide([], [invoice({ dueDate: null }), invoice({ vatAmount: 'x' })]);
     expect(skippedInvoices.map((s) => s.reason)).toEqual(['no_due_date', 'invalid_data']);
   });

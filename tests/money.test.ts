@@ -16,7 +16,7 @@ describe('parseCents', () => {
     expect(parseCents(input)).toBe(expected);
   });
 
-  it('adds exactly where floats do not (finding 6)', () => {
+  it('adds exactly where floats do not (finding 9)', () => {
     expect(0.1 + 0.2).not.toBe(0.3);
     expect(parseCents('0.10') + parseCents('0.20')).toBe(parseCents('0.30'));
   });

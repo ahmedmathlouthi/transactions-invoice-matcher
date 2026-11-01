@@ -37,7 +37,7 @@ describe('runAutoMatching', () => {
     );
   });
 
-  it('lets infrastructure errors propagate instead of swallowing them (finding 10)', async () => {
+  it('lets infrastructure errors propagate instead of swallowing them (finding 3)', async () => {
     const repo = fakeRepo([tx()], [invoice()], {
       recordMatches: async () => {
         throw Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });

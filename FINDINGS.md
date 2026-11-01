@@ -29,57 +29,39 @@ several valid candidates (findings 4–5), which can't be measured without groun
 
 ## 1. How the current implementation works
 
-**`main.ts`** calls `runAutoMatching('900997767')` with a hardcoded SIREN (French company number), then closes the pool.
+`main.ts` runs `runAutoMatching('900997767')` (hardcoded SIREN). In `src/matcher.ts`, the job:
 
-**`src/db.ts`** exports one shared `pg` `Pool`, configured from `PG*` environment variables with local defaults.
+1. finds the company with the SIREN pasted into the SQL text;
+2. loads **every** transaction of its accounts, with no filter on sign, status, deletion or
+   existing match;
+3. for each transaction, re-queries **every** invoice of the company, keeps those whose
+   `tax_free_total + vat_amount` equals `Math.abs(amount)` (float equality) with a due date from
+   3 days before to 30 days after the transaction, ranks them by date gap with a −100 bonus if the
+   label contains the supplier name or invoice number, and writes the best one with an `update`
+   that also pastes values into the SQL;
+4. catches any error with `console.log("skip", e)` and moves on, then prints `Matched X of Y`.
 
-**`src/matcher.ts` → `runAutoMatching(companySiren)`**
-
-1. **Find the company**: `select * from company where siren = '${companySiren}'`. The value is
-   pasted into the SQL text. If no row matches, `company` is `undefined` and `company.id` throws.
-2. **Load all transactions** on the company's accounts. Nothing filters them: not by sign,
-   `status`, `deleted_at` or `matched_invoice_id`.
-3. **For each transaction:**
-   - `getCandidates()` re-queries **every invoice of the company** (one query per transaction).
-   - `findMatch()` keeps the invoices where:
-     - `tax_free_total + vat_amount === Math.abs(transaction.amount)` (JavaScript float equality);
-     - `dayDiff(tx.date, due_date)` is in `[-30, 3]`, so the due date falls between 3 days before
-       and 30 days after the transaction (this is the window the README specifies).
-   - If several invoices remain, `scoreCandidate()` ranks them by `|days between|`, minus 100 if
-     the label contains the supplier name or the invoice number. The lowest score wins.
-   - `update transaction set matched_invoice_id = '…' where id = '…'`, with values pasted into the SQL text.
-   - Any error is caught, printed as `console.log("skip", e)`, and the loop continues.
-4. Prints `Matched X of Y transactions`.
-
-**`scripts/reset.ts`** drops the `public` schema, then runs every `.sql` file in `migrations/` and `seeds/` in sorted order.
-
-**Schema**: money is stored as `real` (low-precision floating point), `due_date` as `varchar`, and
-statuses as free text. There are no foreign keys, no `NOT NULL` constraints, no indexes, and no
-uniqueness rule on matches.
-
-**Tests**: two trivial tests (`normalizeLabel`, `dayDiff`). The matching logic is not tested,
-and `findMatch` and `scoreCandidate` aren't even exported.
+The schema stores money as `real`, `due_date` as `varchar` and statuses as free text, with no
+foreign keys, `NOT NULL`, indexes or uniqueness rules. The two tests cover `normalizeLabel` and
+`dayDiff` only.
 
 ---
 
 ## 2. Findings, ranked by production impact
 
-The findings are grouped by theme, and the groups are ordered by impact. Numbering runs across
-groups, so the numbers still give the overall ranking.
+Findings are numbered in order of harm, and grouped in three tiers.
 
-| Group | Tier | Findings |
+| Tier | Harm | Findings |
 |---|---|---|
-| A. It matches against records that should never match | 1: wrong accounting records | 1–3 |
-| B. When several invoices fit, it picks one anyway | 1: wrong accounting records | 4–5 |
-| C. Amounts and dates are compared incorrectly | 1: wrong or silently missed records | 6–8 |
-| D. Writes and failures are unsafe and invisible | 2: integrity, safety, observability | 9–11 |
-| E. Running and maintaining it | 3: cost and speed of change | 12–16 |
+| 1 | Wrong accounting records, or failures that hide them | 1–7 |
+| 2 | Integrity, missed matches, security | 8–11 |
+| 3 | Cost and speed of change | 12–15 |
 
 ---
 
-### A. It matches against records that should never match
+### Tier 1: wrong accounting records, and the failures that hide them
 
-All 226 measured bad matches in the summary table come from this group.
+All 226 measured bad matches in the summary table come from findings 1, 2 and 6.
 
 #### 1. It never checks whether an invoice can still be paid
 `getCandidates` returns every invoice of the company, including `Cancelled`, `Paid`, soft-deleted
@@ -104,18 +86,17 @@ Measured: 35 matches are on such transactions (8 incoming, 5 deleted, 22 pending
 **Consequence:** the job can't safely run more than once, it silently undoes users' corrections,
 and it creates matches for money that never left the account.
 
-#### 3. Duplicate bank-feed rows are matched as if they were real payments
-The bank feed delivered the same payment twice: two rows on account `…0001` with
-`remote_id = BNK-2026-000777`, rent of −€1,500 on 2026-12-01. The job matches **both** to the
-same rent invoice (`LOYER-2026-12`). Nothing deduplicates on `(account_id, remote_id)`, and the
-schema has no unique constraint on it.
+#### 3. Errors are swallowed
+The `catch` block logs `skip` and continues. On the seed data, the invoice with a `NULL`
+`supplier_name` makes `normalizeLabel` throw (`matcher.ts:35` → `:20`). The throw happens while
+scoring all candidates, so the whole transaction goes unmatched even when another candidate was
+valid. The same `catch` hides a lost database connection: during a Docker outage, the job printed
+one `skip ECONNRESET` per transaction and still exited normally with a summary line.
 
-**Consequence:** a feed glitch turns into a double-paid invoice in the books. The matcher should
-catch this kind of upstream problem, not spread it further.
+**Consequence:** partial or failed runs look like successful ones, so monitoring never alerts.
 
----
-
-### B. When several invoices fit, it picks one anyway
+**Why third:** it hides findings 1 and 2, and everything below. The job keeps reporting success
+while it writes wrong records, or none at all.
 
 #### 4. It has no notion of ambiguity
 **226 transactions** of company `900997767` have more than one invoice with the right amount
@@ -143,11 +124,39 @@ confidence, margin between the top two candidates, or abstaining.
 **Consequence:** the tie-breaker that's supposed to make ambiguous cases safer can confidently
 pick the wrong invoice.
 
+#### 6. Duplicate bank-feed rows are matched as if they were real payments
+The bank feed delivered the same payment twice: two rows on account `…0001` with
+`remote_id = BNK-2026-000777`, rent of −€1,500 on 2026-12-01. The job matches **both** to the
+same rent invoice (`LOYER-2026-12`). Nothing deduplicates on `(account_id, remote_id)`, and the
+schema has no unique constraint on it.
+
+**Consequence:** a feed glitch turns into a double-paid invoice in the books. The matcher should
+catch this kind of upstream problem, not spread it further.
+
+#### 7. Dates can be off by one day
+`pg` turns the `date` column into a JavaScript Date at **local** midnight, while
+`new Date("2026-08-16")` reads the `varchar` due date as **UTC** midnight. In Europe/Paris
+(UTC+1 or +2) the difference picks up a few hours, and `Math.floor` turns that into a whole day.
+
+**Consequence:** invoices right at the −3 or +30 day edge of the window are wrongly accepted or
+rejected, and the result depends on the server's timezone and on daylight saving time.
+
 ---
 
-### C. Amounts and dates are compared incorrectly
+### Tier 2: integrity, missed matches and security
 
-#### 6. Money is stored and compared as floating point
+Missed matches rank below wrong ones, even at high volume: the customer sees work left to do by
+hand, not a false record in the books.
+
+#### 8. Writes are not safe or auditable
+Each `update` stands alone: no database transaction, no `where matched_invoice_id is null` guard,
+and no unique constraint on `matched_invoice_id`. Nothing records *why* a match was made (which
+rule, what score, when, which run).
+
+**Consequence:** two runs at the same time, or a run during a manual edit, race each other. A wrong
+match can't be audited, explained to the customer, or reverted in bulk.
+
+#### 9. Money is stored and compared as floating point
 `real` holds only about 6–7 significant digits, and `tax_free_total + vat_amount === amount`
 compares JavaScript floats exactly.
 
@@ -159,41 +168,15 @@ never equal a transaction amount, so they are silently unmatchable.
 different values look equal, which produces a wrong match. Money needs `numeric(…,2)` or whole
 cents (integer).
 
-#### 7. Dates can be off by one day
-`pg` turns the `date` column into a JavaScript Date at **local** midnight, while
-`new Date("2026-08-16")` reads the `varchar` due date as **UTC** midnight. In Europe/Paris
-(UTC+1 or +2) the difference picks up a few hours, and `Math.floor` turns that into a whole day.
+**Why Tier 2:** it mostly causes **missed** matches, not wrong ones, even though it affects far
+more records than the findings above it.
 
-**Consequence:** invoices right at the −3 or +30 day edge of the window are wrongly accepted or
-rejected, and the result depends on the server's timezone and on daylight saving time.
-
-#### 8. Invoices without a due date can never match
+#### 10. Invoices without a due date can never match
 **1,051 invoices have a `NULL` `due_date`.** `new Date(null)` is 1970-01-01, so they fall outside
 every date window. Nothing reports or counts them.
 
 **Consequence:** silent missed matches. The customer just sees work left for them to do by hand,
 with no explanation.
-
----
-
-### D. Writes and failures are unsafe and invisible
-
-#### 9. Writes are not safe or auditable
-Each `update` stands alone: no database transaction, no `where matched_invoice_id is null` guard,
-and no unique constraint on `matched_invoice_id`. Nothing records *why* a match was made (which
-rule, what score, when, which run).
-
-**Consequence:** two runs at the same time, or a run during a manual edit, race each other. A wrong
-match can't be audited, explained to the customer, or reverted in bulk.
-
-#### 10. Errors are swallowed
-The `catch` block logs `skip` and continues. On the seed data, the invoice with a `NULL`
-`supplier_name` makes `normalizeLabel` throw (`matcher.ts:35` → `:20`). The throw happens while
-scoring all candidates, so the whole transaction goes unmatched even when another candidate was
-valid. The same `catch` hides a lost database connection: during a Docker outage, the job printed
-one `skip ECONNRESET` per transaction and still exited normally with a summary line.
-
-**Consequence:** partial or failed runs look like successful ones, so monitoring never alerts.
 
 #### 11. SQL injection
 All four queries paste values into the SQL text. Today the inputs come from the code itself or the
@@ -206,7 +189,7 @@ isn't exposed yet.
 
 ---
 
-### E. Running and maintaining it
+### Tier 3: cost and speed of change
 
 #### 12. It's slow because of N+1 queries
 About 1,200 transactions × one "all 35,017 invoices of the company" query each, so roughly
@@ -215,24 +198,24 @@ About 1,200 transactions × one "all 35,017 invoices of the company" query each,
 **Consequence:** timeouts and heavy database load at real customer volumes. Load invoices once and
 index them by amount, or do the amount and date filtering in SQL.
 
-#### 13. The code has no structure to fix things in
-Business rules, SQL and orchestration all live in one function, so none of the fixes above can be
-tested without a database. See §3 for the detailed review.
+#### 13. No structure, and no real tests
+Business rules, SQL and orchestration all live in one function, and `findMatch` and
+`scoreCandidate` aren't even exported, so none of the rules above can be tested without a database.
+The only two tests check `normalizeLabel` and `dayDiff`. See §3.
 
-**Consequence:** every Tier 1 fix is risky to ship and hard to prove correct.
+**Consequence:** none of the Tier 1 fixes can be proven correct, and each one ships with regression
+risk.
 
 #### 14. The schema enforces nothing
 No foreign keys, no `NOT NULL`, no `CHECK` constraints or enums on statuses, no indexes, no
 uniqueness on `(account_id, remote_id)` or invoice numbers, and `due_date` stored as `varchar`.
 
-**Consequence:** bad data gets in quietly, and every consumer has to defend against it.
+**Consequence:** bad data gets in quietly, and the matcher pays for it. The seed shows each case:
+an empty invoice number that wins every tie (finding 5), a `NULL` supplier name that crashes
+scoring (finding 3), 1,051 missing due dates (finding 10), a duplicated bank row (finding 6), and a
+transaction whose account doesn't exist.
 
-#### 15. No real tests
-None of the rules above are covered. The only two tests check `normalizeLabel` and `dayDiff`.
-
-**Consequence:** every fix to the Tier 1 problems carries regression risk.
-
-#### 16. Smaller issues
+#### 15. Smaller issues
 - A missing company crashes with an unhelpful `TypeError`.
 - The SIREN is hardcoded in `main.ts`.
 - The magic numbers `-30`, `3` and `-100` aren't named.
@@ -240,76 +223,57 @@ None of the rules above are covered. The only two tests check `normalizeLabel` a
 - The TypeScript types claim fields can't be null when the data has nulls (`due_date`,
   `supplier_name`).
 
+**Consequence:** slower diagnosis and harder reading, but no wrong records on their own.
+
 ---
 
 ## 3. Code structure review
 
-**Short answer: yes, it's under-structured, and that matters here.** It isn't about style. The
-structure is why findings 1–8 went unnoticed and why they are hard to fix safely. It shouldn't
-become a layered enterprise design either. For ~100 lines, three small pieces are enough.
+**Yes, it's under-structured, and that matters here.** `matcher.ts` mixes data access, eligibility
+rules (missing, hence findings 1, 2 and 6), the matching decision, writes and reporting in one
+function. The core problem is that **the decision isn't a pure function**, so the test that matters
+most can't be written: "given these transactions and invoices, this is matched, this is left alone,
+and why". It shouldn't become a layered enterprise design either.
 
-### What's wrong today
-
-`matcher.ts` is one file doing five jobs:
-
-| Concern | Where it lives today | Problem |
-|---|---|---|
-| Data access | Inline SQL strings in `runAutoMatching` and `getCandidates` | Interpolated, `select *`, and it imports the global `db` pool directly |
-| Eligibility rules (which records may match) | Missing. Never applied. | Findings 1–3 come from it not existing |
-| Matching decision (filter, score, pick) | `findMatch` and `scoreCandidate`, not exported | Can't be unit-tested, and has no "ambiguous" outcome |
-| Writing results | An `update` inside the loop | No transaction, no guard, no audit trail |
-| Orchestration and reporting | `runAutoMatching`, with `try/catch` and `console.log` | Swallows errors and reports only a count |
-
-The core problem is that **the decision logic isn't a pure function**. It's mixed with I/O, so you
-can't write the test that matters most: "given these transactions and invoices, this is what gets
-matched, this is left alone, and why".
-
-### Is a repository missing?
-
-Yes, but as a thin query module, not as a pattern for its own sake. Its value here is concrete:
-
-1. **Testability.** The matcher can depend on an interface, and tests can use in-memory data
-   instead of Postgres.
-2. **One place for the eligibility rules in SQL.** "Open invoice", "outgoing, booked, not deleted,
-   not yet matched transaction" and "not already claimed" get defined once, as parameterised
-   queries, instead of being forgotten in each caller.
-3. **Safe writes.** `recordMatches` can own the database transaction, the
-   `where matched_invoice_id is null` guard and the audit row.
-
-### Proposed shape
+### What I built
 
 ```
-main.ts                  entry point: parse SIREN, run job, exit code ≠ 0 on failure
+main.ts              CLI: SIREN in, run summary and review CSV out, typed exit codes
 src/
-  db.ts                  pool (unchanged)
-  money.ts, dates.ts     cents as integers, date-only values (no Date/timezone)
-  repository.ts          loadCompany, loadOpenTransactions, loadOpenInvoices,
-                         recordMatches (one DB transaction, guarded)
-  matching.ts            PURE: decide(transactions, invoices, config) →
-                         { matched[], ambiguous[], noCandidate[] }, each with a reason
-  job.ts                 orchestration: load → decide → write → report;
-                         infrastructure errors stop the run
+  db.ts              pool (unchanged)
+  money.ts           text → integer cents, never floats
+  dates.ts           YYYY-MM-DD calendar days, timezone-free
+  errors.ts          typed errors with exit codes
+  repository.ts      all SQL, parameterised: company, open transactions, open invoices,
+                     recordMatches (one guarded UPDATE)
+  matching/
+    types.ts         records, outcomes, strategy interface
+    decide.ts        PURE: eligibility, candidates, strategies, conflicts
+    strategies.ts    reference → single candidate → supplier named in the label
+  report.ts          review CSV for finance
+  job.ts             load → decide → write → summary
+  schema.ts          reset helper for db:reset and the integration tests
 ```
 
-- `matching.ts` has no imports from `pg` or `db`. Rules are small functions (filters, then
-  scorers), and thresholds live in a config object (window −3/+30, minimum confidence margin).
-- The result type includes **ambiguous** and **no candidate** as first-class outcomes. That is the
-  structural fix for finding 4: "unsure" becomes something the code can say.
-- Tests: most coverage on `matching.ts` (fast, table-driven), plus a few integration tests of
-  `repository.ts` against the Docker database.
+- **Pure core.** `decide` imports nothing from `pg`. Most tests run on it in memory; a few run the
+  real job against the Docker database.
+- **Repository as a thin interface**, not a pattern for its own sake: one place for "open invoice"
+  and "open transaction" in SQL, and a fake in the job tests.
+- **Strategies as an ordered list.** Each can match, reject or pass, so a rule can veto a match,
+  and new rules don't touch the others.
+- **Ambiguous is an outcome.** That is the structural fix for finding 4: "unsure" becomes something
+  the code can say.
 
-### What I'd deliberately not add
-No DI container, no service and manager classes, no generic `Repository<T>` base, no ORM. A
-module of plain functions with typed inputs and outputs is enough at this size. Passing
-dependencies in as parameters does the job of dependency injection.
+### What changed from my first plan
+- **No explicit database transaction.** The write is a single `UPDATE … FROM unnest(…)`, which
+  Postgres applies all or nothing, with a `matched_invoice_id is null` guard.
+- **No audit table.** Only a `matched_at` column, because I treated the database as production.
+  The run summary counts matches per strategy, but which rule made each match isn't stored.
+- **No confidence margin.** The job matches only when exactly one candidate survives the rules,
+  which is stricter and simpler to defend.
 
-### Mapped to SOLID, briefly
-- **Single responsibility** and **dependency inversion** are the two that matter. The split above
-  fixes both.
-- **Open/closed** becomes cheap with rules as a list of functions.
-- **Liskov substitution** and **interface segregation** barely apply to a procedural module this
-  size. The only related issue is the row types claiming fields are non-null when the data has
-  nulls.
+No DI container, service classes, generic `Repository<T>` or ORM: plain functions with typed inputs,
+and dependencies passed as parameters.
 
 ---
 
