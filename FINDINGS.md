@@ -315,4 +315,30 @@ dependencies in as parameters does the job of dependency injection.
 
 ## 4. Note: what's left undone, open product questions, next steps
 
-_To be written after the rework._
+### Left undone, on purpose
+- Only one migration: a nullable `matched_at` column. The database is treated as production.
+- Schema follow-ups, each needing a clean-up or a zero-downtime migration first:
+  - amounts `real` → `numeric(14,2)`; amounts above ~€10,000 may have lost cents and must be
+    re-imported
+  - unique index on `transaction(matched_invoice_id)`, after cleaning up double matches
+  - unique `(account_id, remote_id)`, so a bank movement can't be stored twice
+  - lookup indexes, built `concurrently`
+  - `due_date` `varchar` → `date`
+- Concurrency is left to the caller: one run per company at a time.
+- The final `UPDATE` doesn't re-check that the invoice is still open and unmatched.
+- Matches the original job may have written in production are not audited.
+
+### Needed from product
+- Which invoice statuses can be paid? I assumed `ToPay` and `Pending`.
+- What to do with invoices without a due date? 646 open ones can never match today.
+- Can recurring payments go to the oldest open invoice first? That would resolve 144 of the 149
+  ambiguous transactions.
+- Is the window (3 days before, 30 days after) right? Are amounts always exact?
+
+### Next steps
+1. Re-check the invoice inside the `UPDATE` (no schema change).
+2. Run the job from a queue, one run per company, triggered by new transactions and new invoices.
+   Select work by state, not by a "last run" timestamp.
+3. Audit existing matches, then add the unique index on `matched_invoice_id`.
+4. Read finance's choices back from the review sheet.
+5. Move amounts to `numeric` and due dates to `date`.
