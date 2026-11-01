@@ -2,11 +2,15 @@ import { describe, expect, it } from 'vitest';
 import { daysBetween, parseCalendarDate } from '../src/dates';
 import { InvalidDataError } from '../src/errors';
 
+// Run these in Paris time, like production: CI machines usually run in UTC, where
+// daylight-saving bugs stay hidden. Node applies a TZ change at runtime.
+process.env.TZ = 'Europe/Paris';
+
 const d = parseCalendarDate;
 
 describe('daysBetween', () => {
-  it('runs under a non-UTC timezone, as production would', () => {
-    expect(process.env.TZ).toBe('Europe/Paris');
+  it('runs in Paris time (UTC+2 in summer)', () => {
+    expect(new Date(2026, 6, 1).getTimezoneOffset()).toBe(-120);
   });
 
   it('counts whole calendar days', () => {
